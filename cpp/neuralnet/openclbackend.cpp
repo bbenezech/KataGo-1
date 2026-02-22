@@ -15,6 +15,13 @@
 #include "../core/simpleallocator.h"
 #include "../core/test.h"
 
+#include <chrono>
+#include <iostream>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 //------------------------
 #include "../core/using.h"
 //------------------------
@@ -22,6 +29,22 @@
 using namespace OpenCLHelpers;
 
 using half_t = half_float::half;
+
+namespace {
+
+void emitOpenclInitProbe(Logger* logger, const string& message) {
+  const string withPrefix = "[OpenCLInitProbe] " + message;
+  if(logger != NULL)
+    logger->write(withPrefix);
+#ifndef __ANDROID__
+  cerr << withPrefix << endl;
+#endif
+#ifdef __ANDROID__
+  __android_log_print(ANDROID_LOG_INFO, "KataGoOpenCLInit", "%s", message.c_str());
+#endif
+}
+
+}
 
 //======================================================================================================
 /*
@@ -372,15 +395,45 @@ struct ComputeContext {
     usingFP16Mode(useFP16Mode),
     usingNHWCMode(useNHWCMode)
   {
+    emitOpenclInitProbe(logger, "ComputeContext begin nnXLen=" + std::to_string(nnXLen) + " nnYLen=" + std::to_string(nnYLen));
+    const auto devicesBegin = std::chrono::steady_clock::now();
     vector<DeviceInfo> allDeviceInfos = DeviceInfo::getAllDeviceInfosOnSystem(logger);
+    const auto devicesElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - devicesBegin
+    ).count();
+    emitOpenclInitProbe(logger, "ComputeContext devices enumerated count=" + std::to_string(allDeviceInfos.size()) + " durationMs=" + std::to_string(devicesElapsedMs));
+
+    const auto devicesContextBegin = std::chrono::steady_clock::now();
     devicesContext = new DevicesContext(allDeviceInfos,gIdxs,logger,liveProfilingKernels);
+    const auto devicesContextElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - devicesContextBegin
+    ).count();
+    emitOpenclInitProbe(
+      logger,
+      "ComputeContext devices context ready selectedDevices=" + std::to_string(devicesContext->devicesToUse.size()) +
+      " durationMs=" + std::to_string(devicesContextElapsedMs)
+    );
 
     for(int i = 0; i<devicesContext->devicesToUse.size(); i++) {
       const InitializedDevice* device = devicesContext->devicesToUse[i];
       const string& name = device->info.name;
       vector<cl_device_id> deviceIds = { device->info.deviceId };
 
+      emitOpenclInitProbe(
+        logger,
+        "ComputeContext tuning params begin gpuIdx=" + std::to_string(device->info.gpuIdx) +
+        " deviceName=" + name
+      );
+      const auto tuneParamsBegin = std::chrono::steady_clock::now();
       OpenCLTuneParams tuneParams = getParamsForDeviceName(name, device->info.gpuIdx);
+      const auto tuneParamsElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - tuneParamsBegin
+      ).count();
+      emitOpenclInitProbe(
+        logger,
+        "ComputeContext tuning params done gpuIdx=" + std::to_string(device->info.gpuIdx) +
+        " durationMs=" + std::to_string(tuneParamsElapsedMs)
+      );
 
       bool useFP16Storage = false;
       bool useFP16Compute = false;
@@ -406,12 +459,30 @@ struct ComputeContext {
         useFP16TensorCoresFor1x1 = tuneParams.shouldUseFP16TensorCoresFor1x1;
       }
 
+      emitOpenclInitProbe(
+        logger,
+        "ComputeContext compile programs begin gpuIdx=" + std::to_string(device->info.gpuIdx) +
+        " fp16Storage=" + std::to_string(useFP16Storage ? 1 : 0) +
+        " fp16Compute=" + std::to_string(useFP16Compute ? 1 : 0) +
+        " fp16TensorCores=" + std::to_string(useFP16TensorCores ? 1 : 0)
+      );
+      const auto compileProgramsBegin = std::chrono::steady_clock::now();
       CompiledPrograms* compiledPrograms = new CompiledPrograms(
         device->context, deviceIds, tuneParams,
         useFP16Storage, useFP16Compute, useFP16TensorCores, useFP16TensorCoresFor1x1
       );
+      const auto compileProgramsElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - compileProgramsBegin
+      ).count();
+      emitOpenclInitProbe(
+        logger,
+        "ComputeContext compile programs done gpuIdx=" + std::to_string(device->info.gpuIdx) +
+        " durationMs=" + std::to_string(compileProgramsElapsedMs)
+      );
       compiledProgramsByDeviceId[device->info.deviceId] = compiledPrograms;
     }
+
+    emitOpenclInitProbe(logger, "ComputeContext ready");
   }
 
   ~ComputeContext() {
@@ -466,23 +537,58 @@ ComputeContext* NeuralNet::createComputeContext(
   if(gpuIdxs.size() <= 0)
     throw StringError("NeuralNet::createComputeContext - specified no gpus to use");
 
+  emitOpenclInitProbe(
+    logger,
+    "createComputeContext begin nnXLen=" + std::to_string(nnXLen) +
+    " nnYLen=" + std::to_string(nnYLen) +
+    " gpuCount=" + std::to_string(gpuIdxs.size())
+  );
+
   std::function<OpenCLTuneParams(const string&,int)> getParamsForDeviceName =
     [&openCLTunerFile,&homeDataDirOverride,openCLReTunePerBoardSize,logger,nnXLen,nnYLen,useFP16Mode,loadedModel](const string& name, int gpuIdxForTuning) {
+    emitOpenclInitProbe(
+      logger,
+      "createComputeContext loadOrAutoTune begin gpuIdx=" + std::to_string(gpuIdxForTuning) +
+      " deviceName=" + name
+    );
+    const auto tuneBegin = std::chrono::steady_clock::now();
+
     bool full = false;
     enabled_t testFP16Mode = useFP16Mode;
     enabled_t testFP16StorageMode = useFP16Mode;
     enabled_t testFP16ComputeMode = enabled_t::Auto;
+#ifdef __ANDROID__
+    enabled_t testFP16TensorCoresMode = enabled_t::False;
+#else
     enabled_t testFP16TensorCoresMode = enabled_t::Auto;
+#endif
 
-    return OpenCLTuner::loadOrAutoTune(
+    OpenCLTuneParams tuneParams = OpenCLTuner::loadOrAutoTune(
       openCLTunerFile,homeDataDirOverride,name,gpuIdxForTuning,logger,openCLReTunePerBoardSize,
       nnXLen,nnYLen,
       testFP16Mode,testFP16StorageMode,testFP16ComputeMode,testFP16TensorCoresMode,
       OpenCLTuner::ModelInfoForTuning::ofDesc(&(loadedModel->modelDesc)),
       full
     );
+
+    const auto tuneElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - tuneBegin
+    ).count();
+    emitOpenclInitProbe(
+      logger,
+      "createComputeContext loadOrAutoTune done gpuIdx=" + std::to_string(gpuIdxForTuning) +
+      " durationMs=" + std::to_string(tuneElapsedMs)
+    );
+    return tuneParams;
   };
-  return new ComputeContext(gpuIdxs,logger,nnXLen,nnYLen,useFP16Mode,useNHWCMode,getParamsForDeviceName);
+
+  const auto contextBegin = std::chrono::steady_clock::now();
+  ComputeContext* context = new ComputeContext(gpuIdxs,logger,nnXLen,nnYLen,useFP16Mode,useNHWCMode,getParamsForDeviceName);
+  const auto contextElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - contextBegin
+  ).count();
+  emitOpenclInitProbe(logger, "createComputeContext done durationMs=" + std::to_string(contextElapsedMs));
+  return context;
 }
 
 void NeuralNet::freeComputeContext(ComputeContext* computeContext) {

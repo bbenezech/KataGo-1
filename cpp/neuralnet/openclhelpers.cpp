@@ -5,9 +5,29 @@
 #include "../core/test.h"
 #include "../neuralnet/opencltuner.h"
 
+#include <chrono>
+#include <iostream>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 using namespace std;
 
 using half_t = half_float::half;
+
+namespace {
+
+void emitOpenclInitProbe(const string& message) {
+#ifndef __ANDROID__
+  cerr << "[OpenCLInitProbe] " << message << endl;
+#endif
+#ifdef __ANDROID__
+  __android_log_print(ANDROID_LOG_INFO, "KataGoOpenCLInit", "%s", message.c_str());
+#endif
+}
+
+}
 
 const string OpenCLHelpers::getErrorMessage(cl_int error)
 {
@@ -94,6 +114,14 @@ static size_t byteSizeofVectorContents(const typename std::vector<T>& vec) {
 }
 
 cl_program OpenCLHelpers::compileProgram(const string& name, cl_context context, const vector<cl_device_id>& devices, const string& str, const string& options) {
+  const auto begin = std::chrono::steady_clock::now();
+  emitOpenclInitProbe(
+    "compileProgram start name=" + name +
+    " sourceBytes=" + std::to_string(str.size()) +
+    " optionsBytes=" + std::to_string(options.size()) +
+    " devices=" + std::to_string(devices.size())
+  );
+
   const char* lines[1] = {str.c_str()};
   const size_t sizes[1] = {str.size()};
   cl_int err;
@@ -104,6 +132,15 @@ cl_program OpenCLHelpers::compileProgram(const string& name, cl_context context,
 
   err = clBuildProgram(program, (cl_uint)devices.size(), devices.data(), opts.c_str(), NULL, NULL);
   if(err != 0) {
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - begin
+    ).count();
+    emitOpenclInitProbe(
+      "compileProgram error name=" + name +
+      " error=" + OpenCLHelpers::getErrorMessage(err) +
+      " durationMs=" + std::to_string(elapsedMs)
+    );
+
     string s;
     s += OpenCLHelpers::getErrorMessage(err) + string("\n");
     for(int i = 0; i<devices.size(); i++) {
@@ -118,6 +155,15 @@ cl_program OpenCLHelpers::compileProgram(const string& name, cl_context context,
     clReleaseProgram(program);
     throw CompileError(s);
   }
+
+  const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - begin
+  ).count();
+  emitOpenclInitProbe(
+    "compileProgram done name=" + name +
+    " durationMs=" + std::to_string(elapsedMs)
+  );
+
   return program;
 }
 

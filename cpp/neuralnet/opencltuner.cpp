@@ -10,12 +10,34 @@
 #include "../core/threadsafecounter.h"
 #include "../dataio/homedata.h"
 
+#include <chrono>
 #include <cstring>
+#include <iostream>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 using namespace std;
 using namespace OpenCLHelpers;
 
 using half_t = half_float::half;
+
+namespace {
+
+void emitOpenclInitProbe(Logger* logger, const string& message) {
+  const string withPrefix = "[OpenCLInitProbe] " + message;
+  if(logger != NULL)
+    logger->write(withPrefix);
+#ifndef __ANDROID__
+  cerr << withPrefix << endl;
+#endif
+#ifdef __ANDROID__
+  __android_log_print(ANDROID_LOG_INFO, "KataGoOpenCLInit", "%s", message.c_str());
+#endif
+}
+
+}
 
 static map<string,int> readDescKeyValues(const string& fileName, const string& desc) {
   istringstream kvIn(desc);
@@ -863,14 +885,42 @@ static bool testAllConfigs(
   // First get a result computed on CPU to compare to.
   {
     const bool computeOnCPU = true;
-    OpenCLTuneAccums cpuAccums = testConfig(referenceConfig,referenceRet,computeOnCPU);
+    OpenCLTuneAccums cpuAccums;
+    try {
+      cpuAccums = testConfig(referenceConfig,referenceRet,computeOnCPU);
+    }
+    catch(const std::exception& e) {
+      cpuAccums.bad = true;
+      cpuAccums.badErr = -9999;
+      cpuAccums.detailedErrorMessage = string("Exception while testing reference CPU config: ") + e.what();
+    }
+    catch(...) {
+      cpuAccums.bad = true;
+      cpuAccums.badErr = -9999;
+      cpuAccums.detailedErrorMessage = "Unknown exception while testing reference CPU config";
+    }
     if(!cpuAccums.bad)
       referenceRetIsFilled = true;
   }
 
   out << "Testing " << configs.size() << " different configs" << endl;
   for(int i = 0; i<configs.size(); i++) {
-    OpenCLTuneAccums accums = testConfig(configs[i],ret,false);
+    OpenCLTuneAccums accums;
+    try {
+      accums = testConfig(configs[i],ret,false);
+    }
+    catch(const std::exception& e) {
+      accums.bad = true;
+      accums.badErr = -9999;
+      accums.detailedErrorMessage =
+        string("Exception while testing config #") + Global::intToString(i) + ": " + e.what();
+    }
+    catch(...) {
+      accums.bad = true;
+      accums.badErr = -9999;
+      accums.detailedErrorMessage =
+        string("Unknown exception while testing config #") + Global::intToString(i);
+    }
 
     numTested++;
     if(accums.bad) {
@@ -1008,6 +1058,7 @@ static void tuneXGemmDirect(
   int nnYLen,
   OpenCLTuner::ModelInfoForTuning modelInfo,
   bool full,
+  Logger* logger,
   ostream& out,
   bool verboseErrors,
   bool verboseTuner,
@@ -1070,10 +1121,59 @@ static void tuneXGemmDirect(
   configs.insert(configs.begin(),slightlyTunedConfig);
   configs.insert(configs.begin(),currentConfig);
 
+  int plannedGpuIterations = 0;
+  {
+    vector<OpenCLTuneParams> plannedConfigs = configs;
+    plannedConfigs.insert(plannedConfigs.begin(), referenceConfig);
+    dedupConfigsStable(plannedConfigs);
+    plannedGpuIterations = (int)plannedConfigs.size();
+  }
+  emitOpenclInitProbe(
+    logger,
+    "tuneXGemmDirect iteration plan totalConfigs=" + std::to_string(plannedGpuIterations) +
+    " full=" + std::to_string(full ? 1 : 0)
+  );
+
+  int gpuTestCounter = 0;
+  static constexpr int kProgressEmitEvery = 1;
+  static constexpr int kRepProgressEmitEvery = 3;
+  const auto tuningPhaseBegin = std::chrono::steady_clock::now();
+
   auto getDesc = [](const OpenCLTuneParams& cfg) { return cfg.xGemmDirect.desc(); };
 
   auto test = [&](const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU) {
     OpenCLTuneAccums accums;
+    const auto configBegin = std::chrono::steady_clock::now();
+    int configIndex = -1;
+    cl_int lastOpenclErr = CL_SUCCESS;
+
+    if(!computeOnCPU) {
+      gpuTestCounter += 1;
+      configIndex = gpuTestCounter;
+      if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - tuningPhaseBegin
+        ).count();
+        const double avgPerConfigMs = gpuTestCounter > 0 ? (double)elapsedMs / (double)gpuTestCounter : 0.0;
+        const int remaining = std::max(0, plannedGpuIterations - gpuTestCounter);
+        const long long etaMs = (long long)(avgPerConfigMs * (double)remaining);
+        emitOpenclInitProbe(
+          logger,
+          "tuneXGemmDirect progress tested=" + std::to_string(gpuTestCounter) +
+          "/" + std::to_string(plannedGpuIterations) +
+          " elapsedMs=" + std::to_string(elapsedMs) +
+          " avgPerConfigMs=" + std::to_string((long long)avgPerConfigMs) +
+          " etaMs=" + std::to_string(etaMs) +
+          " config=\"" + cfg.xGemmDirect.desc() + "\""
+        );
+      }
+      emitOpenclInitProbe(
+        logger,
+        "tuneXGemmDirect config begin tested=" + std::to_string(configIndex) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " config=\"" + cfg.xGemmDirect.desc() + "\""
+      );
+    }
 
     cl_int err;
     cl_program program;
@@ -1135,6 +1235,18 @@ static void tuneXGemmDirect(
         continue;
       }
 
+      const bool emitRepMarker = (i == 0 || i == reps - 1 || ((i + 1) % 6) == 0);
+      if(emitRepMarker) {
+        emitOpenclInitProbe(
+          logger,
+          "tuneXGemmDirect rep begin tested=" + std::to_string(configIndex) +
+          "/" + std::to_string(plannedGpuIterations) +
+          " rep=" + std::to_string(i + 1) + "/" + std::to_string(reps) +
+          " inChannels=" + std::to_string(inChannels) +
+          " outChannels=" + std::to_string(outChannels)
+        );
+      }
+      const auto repBegin = std::chrono::steady_clock::now();
       cl_event event;
       err = doStridedBatchedXGemmDirect_KM_KN_NM(
         kernel,
@@ -1149,6 +1261,19 @@ static void tuneXGemmDirect(
 
 
       accums.countResultAndFreeEvent(err,event,weight);
+      if(emitRepMarker) {
+        const auto repElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - repBegin
+        ).count();
+        emitOpenclInitProbe(
+          logger,
+          "tuneXGemmDirect rep done tested=" + std::to_string(configIndex) +
+          "/" + std::to_string(plannedGpuIterations) +
+          " rep=" + std::to_string(i + 1) + "/" + std::to_string(reps) +
+          " durationMs=" + std::to_string(repElapsedMs) +
+          " status=" + std::string(accums.bad ? "bad" : "ok")
+        );
+      }
       if(accums.bad)
         break;
       if(i < numToRecord)
@@ -1164,6 +1289,19 @@ static void tuneXGemmDirect(
 
     clReleaseKernel(kernel);
     clReleaseProgram(program);
+
+    if(!computeOnCPU) {
+      const auto configElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - configBegin
+      ).count();
+      emitOpenclInitProbe(
+        logger,
+        "tuneXGemmDirect config done tested=" + std::to_string(configIndex) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " durationMs=" + std::to_string(configElapsedMs) +
+        " status=" + std::string(accums.bad ? "bad" : "ok")
+      );
+    }
 
     return accums;
   };
@@ -1184,6 +1322,15 @@ static void tuneXGemmDirect(
     std::function<OpenCLTuneAccums(const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU)>(test),
     bestKernelsPerSecond
   );
+  const auto totalElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - tuningPhaseBegin
+  ).count();
+  emitOpenclInitProbe(
+    logger,
+    "tuneXGemmDirect complete tested=" + std::to_string(gpuTestCounter) +
+    "/" + std::to_string(plannedGpuIterations) +
+    " elapsedMs=" + std::to_string(totalElapsedMs)
+  );
   tunedConfig = currentConfig;
 }
 
@@ -1198,6 +1345,7 @@ static bool tuneXGemm(
   int nnYLen,
   OpenCLTuner::ModelInfoForTuning modelInfo,
   bool full,
+  Logger* logger,
   ostream& out,
   bool useFP16Storage,
   bool verboseErrors,
@@ -1281,10 +1429,60 @@ static bool tuneXGemm(
   configs.insert(configs.begin(),slightlyTunedConfig);
   configs.insert(configs.begin(),currentConfig);
 
+  int plannedGpuIterations = 0;
+  {
+    vector<OpenCLTuneParams> plannedConfigs = configs;
+    plannedConfigs.insert(plannedConfigs.begin(), referenceConfig);
+    dedupConfigsStable(plannedConfigs);
+    plannedGpuIterations = (int)plannedConfigs.size();
+  }
+  emitOpenclInitProbe(
+    logger,
+    "tuneXGemm iteration plan totalConfigs=" + std::to_string(plannedGpuIterations) +
+    " full=" + std::to_string(full ? 1 : 0) +
+    " useFP16Storage=" + std::to_string(useFP16Storage ? 1 : 0)
+  );
+
+  int gpuTestCounter = 0;
+  static constexpr int kProgressEmitEvery = 1;
+  static constexpr int kRepProgressEmitEvery = 3;
+  const auto tuningPhaseBegin = std::chrono::steady_clock::now();
+
   auto getDesc = [](const OpenCLTuneParams& cfg) { return cfg.xGemm.desc(); };
 
   auto test = [&](const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU) {
     OpenCLTuneAccums accums;
+    const auto configBegin = std::chrono::steady_clock::now();
+    int configIndex = -1;
+    cl_int lastOpenclErr = CL_SUCCESS;
+
+    if(!computeOnCPU) {
+      gpuTestCounter += 1;
+      configIndex = gpuTestCounter;
+      if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - tuningPhaseBegin
+        ).count();
+        const double avgPerConfigMs = gpuTestCounter > 0 ? (double)elapsedMs / (double)gpuTestCounter : 0.0;
+        const int remaining = std::max(0, plannedGpuIterations - gpuTestCounter);
+        const long long etaMs = (long long)(avgPerConfigMs * (double)remaining);
+        emitOpenclInitProbe(
+          logger,
+          "tuneXGemm progress tested=" + std::to_string(gpuTestCounter) +
+          "/" + std::to_string(plannedGpuIterations) +
+          " elapsedMs=" + std::to_string(elapsedMs) +
+          " avgPerConfigMs=" + std::to_string((long long)avgPerConfigMs) +
+          " etaMs=" + std::to_string(etaMs) +
+          " config=\"" + cfg.xGemm.desc() + "\""
+        );
+      }
+      emitOpenclInitProbe(
+        logger,
+        "tuneXGemm config begin tested=" + std::to_string(configIndex) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " config=\"" + cfg.xGemm.desc() + "\""
+      );
+    }
 
     cl_int err;
     cl_program program;
@@ -1410,6 +1608,19 @@ static bool tuneXGemm(
     clReleaseKernel(kernel);
     clReleaseProgram(program);
 
+    if(!computeOnCPU) {
+      const auto configElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - configBegin
+      ).count();
+      emitOpenclInitProbe(
+        logger,
+        "tuneXGemm config done tested=" + std::to_string(configIndex) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " durationMs=" + std::to_string(configElapsedMs) +
+        " status=" + std::string(accums.bad ? "bad" : "ok")
+      );
+    }
+
     return accums;
   };
 
@@ -1429,6 +1640,16 @@ static bool tuneXGemm(
     std::function<OpenCLTuneAccums(const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU)>(test),
     bestKernelsPerSecond
   );
+  const auto totalElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - tuningPhaseBegin
+  ).count();
+  emitOpenclInitProbe(
+    logger,
+    "tuneXGemm complete tested=" + std::to_string(gpuTestCounter) +
+    "/" + std::to_string(plannedGpuIterations) +
+    " elapsedMs=" + std::to_string(totalElapsedMs) +
+    " status=" + std::string(suc ? "ok" : "bad")
+  );
   tunedConfig = currentConfig;
   return suc;
 }
@@ -1444,6 +1665,7 @@ static bool tuneXGemm16(
   int nnYLen,
   OpenCLTuner::ModelInfoForTuning modelInfo,
   bool full,
+  Logger* logger,
   ostream& out,
   bool verboseErrors,
   bool verboseTuner,
@@ -1523,10 +1745,59 @@ static bool tuneXGemm16(
   configs.insert(configs.begin(),slightlyTunedConfig);
   configs.insert(configs.begin(),currentConfig);
 
+  int plannedGpuIterations = 0;
+  {
+    vector<OpenCLTuneParams> plannedConfigs = configs;
+    plannedConfigs.insert(plannedConfigs.begin(), referenceConfig);
+    dedupConfigsStable(plannedConfigs);
+    plannedGpuIterations = (int)plannedConfigs.size();
+  }
+  emitOpenclInitProbe(
+    logger,
+    "tuneXGemm16 iteration plan totalConfigs=" + std::to_string(plannedGpuIterations) +
+    " full=" + std::to_string(full ? 1 : 0)
+  );
+
+  int gpuTestCounter = 0;
+  static constexpr int kProgressEmitEvery = 1;
+  static constexpr int kRepProgressEmitEvery = 3;
+  const auto tuningPhaseBegin = std::chrono::steady_clock::now();
+
   auto getDesc = [](const OpenCLTuneParams& cfg) { return cfg.xGemm16.desc(); };
 
   auto test = [&](const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU) {
     OpenCLTuneAccums accums;
+    const auto configBegin = std::chrono::steady_clock::now();
+    int configIndex = -1;
+    cl_int lastOpenclErr = CL_SUCCESS;
+
+    if(!computeOnCPU) {
+      gpuTestCounter += 1;
+      configIndex = gpuTestCounter;
+      if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - tuningPhaseBegin
+        ).count();
+        const double avgPerConfigMs = gpuTestCounter > 0 ? (double)elapsedMs / (double)gpuTestCounter : 0.0;
+        const int remaining = std::max(0, plannedGpuIterations - gpuTestCounter);
+        const long long etaMs = (long long)(avgPerConfigMs * (double)remaining);
+        emitOpenclInitProbe(
+          logger,
+          "tuneXGemm16 progress tested=" + std::to_string(gpuTestCounter) +
+          "/" + std::to_string(plannedGpuIterations) +
+          " elapsedMs=" + std::to_string(elapsedMs) +
+          " avgPerConfigMs=" + std::to_string((long long)avgPerConfigMs) +
+          " etaMs=" + std::to_string(etaMs) +
+          " config=\"" + cfg.xGemm16.desc() + "\""
+        );
+      }
+      emitOpenclInitProbe(
+        logger,
+        "tuneXGemm16 config begin tested=" + std::to_string(configIndex) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " config=\"" + cfg.xGemm16.desc() + "\""
+      );
+    }
 
     cl_int err;
     cl_program program;
@@ -1640,6 +1911,19 @@ static bool tuneXGemm16(
     clReleaseKernel(kernel);
     clReleaseProgram(program);
 
+    if(!computeOnCPU) {
+      const auto configElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - configBegin
+      ).count();
+      emitOpenclInitProbe(
+        logger,
+        "tuneXGemm16 config done tested=" + std::to_string(configIndex) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " durationMs=" + std::to_string(configElapsedMs) +
+        " status=" + std::string(accums.bad ? "bad" : "ok")
+      );
+    }
+
     return accums;
   };
 
@@ -1659,6 +1943,16 @@ static bool tuneXGemm16(
     std::function<OpenCLTuneAccums(const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU)>(test),
     bestKernelsPerSecond
   );
+  const auto totalElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - tuningPhaseBegin
+  ).count();
+  emitOpenclInitProbe(
+    logger,
+    "tuneXGemm16 complete tested=" + std::to_string(gpuTestCounter) +
+    "/" + std::to_string(plannedGpuIterations) +
+    " elapsedMs=" + std::to_string(totalElapsedMs) +
+    " status=" + std::string(suc ? "ok" : "bad")
+  );
   if(suc) {
     tunedConfig = currentConfig;
   }
@@ -1677,6 +1971,7 @@ static bool tuneHGemmWmma(
   int nnYLen,
   OpenCLTuner::ModelInfoForTuning modelInfo,
   bool full,
+  Logger* logger,
   ostream& out,
   bool verboseErrors,
   bool verboseTuner,
@@ -1735,10 +2030,74 @@ static bool tuneHGemmWmma(
 
   configs.insert(configs.begin(),currentConfig);
 
+  int plannedGpuIterations = 0;
+  {
+    vector<OpenCLTuneParams> plannedConfigs = configs;
+    plannedConfigs.insert(plannedConfigs.begin(), referenceConfig);
+    dedupConfigsStable(plannedConfigs);
+    plannedGpuIterations = (int)plannedConfigs.size();
+  }
+  emitOpenclInitProbe(
+    logger,
+    "tuneHGemmWmma iteration plan totalConfigs=" + std::to_string(plannedGpuIterations) +
+    " full=" + std::to_string(full ? 1 : 0)
+  );
+
+  int gpuTestCounter = 0;
+  static constexpr int kProgressEmitEvery = 1;
+  static constexpr int kRepProgressEmitEvery = 3;
+  const auto tuningPhaseBegin = std::chrono::steady_clock::now();
+
   auto getDesc = [](const OpenCLTuneParams& cfg) { return cfg.hGemmWmma.desc(); };
 
   auto test = [&](const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU) {
     OpenCLTuneAccums accums;
+    const auto configBegin = std::chrono::steady_clock::now();
+    int configIndex = -1;
+    cl_int lastOpenclErr = CL_SUCCESS;
+
+    if(!computeOnCPU) {
+      gpuTestCounter += 1;
+      configIndex = gpuTestCounter;
+      if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - tuningPhaseBegin
+        ).count();
+        const double avgPerConfigMs = gpuTestCounter > 0 ? (double)elapsedMs / (double)gpuTestCounter : 0.0;
+        const int remaining = std::max(0, plannedGpuIterations - gpuTestCounter);
+        const long long etaMs = (long long)(avgPerConfigMs * (double)remaining);
+        emitOpenclInitProbe(
+          logger,
+          "tuneHGemmWmma progress tested=" + std::to_string(gpuTestCounter) +
+          "/" + std::to_string(plannedGpuIterations) +
+          " elapsedMs=" + std::to_string(elapsedMs) +
+          " avgPerConfigMs=" + std::to_string((long long)avgPerConfigMs) +
+          " etaMs=" + std::to_string(etaMs) +
+          " config=\"" + cfg.hGemmWmma.desc() + "\""
+        );
+      }
+      emitOpenclInitProbe(
+        logger,
+        "tuneHGemmWmma config begin tested=" + std::to_string(configIndex) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " config=\"" + cfg.hGemmWmma.desc() + "\""
+      );
+    }
+
+    auto emitMarker = [&](const string& marker) {
+      if(computeOnCPU)
+        return;
+      const auto markerElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - configBegin
+      ).count();
+      emitOpenclInitProbe(
+        logger,
+        "tuneHGemmWmma marker tested=" + std::to_string(configIndex) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " phase=" + marker +
+        " elapsedMs=" + std::to_string(markerElapsedMs)
+      );
+    };
 
     cl_int err;
     cl_program program;
@@ -1749,8 +2108,10 @@ static bool tuneHGemmWmma(
       program, compileError
     );
     if(!compileSuc) { accums.bad = true; accums.detailedErrorMessage = compileError; accums.badErr = CL_BUILD_PROGRAM_FAILURE; return accums; }
+    emitMarker("kernel_create_begin");
     cl_kernel kernel = clCreateKernel(program, "hgemmWmmaBatched", &err);
     if(err != 0) { accums.bad = true; accums.badErr = err; return accums; }
+    emitMarker("kernel_create_done");
 
     int numTilesX = (nnXLen + cfg.conv3x3.OUTTILE_XSIZE - 1) / cfg.conv3x3.OUTTILE_XSIZE;
     int numTilesY = (nnYLen + cfg.conv3x3.OUTTILE_YSIZE - 1) / cfg.conv3x3.OUTTILE_YSIZE;
@@ -1773,11 +2134,13 @@ static bool tuneHGemmWmma(
     int outputNumFloats = numTilesTotalPadded * maxOutChannelsPadded * inTileXYSize;
     vector<float> inputVec;
     vector<float> filterVec;
+    emitMarker("buffer_alloc_begin");
     cl_mem input = randomReadOnly3dPaddedBufferHalf(
       "tuneHGemmWmma3x3Input", context, inTileXYSize, maxChannels, maxInChannelsPadded, numTilesTotal, numTilesTotalPadded, 1.0, inputVec);
     cl_mem filter = randomReadOnly3dPaddedBufferHalf(
       "tuneHGemmWmma3x3Filter", context, inTileXYSize, maxChannels, maxInChannelsPadded, maxChannels, maxOutChannelsPadded, 1.0 / sqrt(maxChannels * 3 * 3), filterVec);
     cl_mem output = createReadWriteBufferHalfZeros(context, outputNumFloats);
+    emitMarker("buffer_alloc_done");
 
     const int reps = 18;
     const int numToRecord = 6;
@@ -1812,6 +2175,8 @@ static bool tuneHGemmWmma(
       }
 
       cl_event event;
+      if(!computeOnCPU && i == 0)
+        emitMarker("first_enqueue_begin");
       err = doBatchedHGemmWmma_KM_KN_NM(
         kernel,
         commandQueue,
@@ -1821,12 +2186,41 @@ static bool tuneHGemmWmma(
         inTileXYSize,
         &event
       );
+      lastOpenclErr = err;
+      if(!computeOnCPU && i == 0)
+        emitMarker("first_enqueue_done err=" + std::to_string(err));
 
+      if(!computeOnCPU && i == 0)
+        emitMarker("first_wait_begin");
       accums.countResultAndFreeEvent(err,event,weight);
+      if(accums.bad && accums.badErr != 0)
+        lastOpenclErr = accums.badErr;
+      if(!computeOnCPU && i == 0)
+        emitMarker("first_wait_done badErr=" + std::to_string(accums.badErr));
       if(accums.bad)
         break;
-      if(i < numToRecord)
+      if(i < numToRecord) {
+        if(!computeOnCPU && i == 0)
+          emitMarker("first_readback_begin");
         blockingReadBufferHalfToFloat(commandQueue, output, outputNumFloats, ret.data()+(outputNumFloats * i));
+        if(!computeOnCPU && i == 0)
+          emitMarker("first_readback_done");
+      }
+
+      if(!computeOnCPU && (((i+1) % kRepProgressEmitEvery) == 0 || (i+1) == reps)) {
+        const auto repElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - configBegin
+        ).count();
+        emitOpenclInitProbe(
+          logger,
+          "tuneHGemmWmma rep progress tested=" + std::to_string(configIndex) +
+          "/" + std::to_string(plannedGpuIterations) +
+          " rep=" + std::to_string(i+1) + "/" + std::to_string(reps) +
+          " elapsedMs=" + std::to_string(repElapsedMs) +
+          " weightedTimeSeconds=" + std::to_string(accums.weightedTimeTaken) +
+          " lastOpenclErr=" + std::to_string(lastOpenclErr)
+        );
+      }
     }
 
     if(accums.bad)
@@ -1852,6 +2246,19 @@ static bool tuneHGemmWmma(
     clReleaseKernel(kernel);
     clReleaseProgram(program);
 
+    if(!computeOnCPU) {
+      const auto configElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - configBegin
+      ).count();
+      emitOpenclInitProbe(
+        logger,
+        "tuneHGemmWmma config done tested=" + std::to_string(configIndex) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " durationMs=" + std::to_string(configElapsedMs) +
+        " status=" + std::string(accums.bad ? "bad" : "ok")
+      );
+    }
+
     return accums;
   };
 
@@ -1871,6 +2278,16 @@ static bool tuneHGemmWmma(
     std::function<OpenCLTuneAccums(const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU)>(test),
     bestKernelsPerSecond
   );
+  const auto totalElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - tuningPhaseBegin
+  ).count();
+  emitOpenclInitProbe(
+    logger,
+    "tuneHGemmWmma complete tested=" + std::to_string(gpuTestCounter) +
+    "/" + std::to_string(plannedGpuIterations) +
+    " elapsedMs=" + std::to_string(totalElapsedMs) +
+    " status=" + std::string(suc ? "ok" : "bad")
+  );
   if(suc) {
     tunedConfig = currentConfig;
   }
@@ -1888,6 +2305,7 @@ static bool tuneHGemmWmmaNCHW(
   int nnYLen,
   OpenCLTuner::ModelInfoForTuning modelInfo,
   bool full,
+  Logger* logger,
   ostream& out,
   bool verboseErrors,
   bool verboseTuner,
@@ -1943,10 +2361,57 @@ static bool tuneHGemmWmmaNCHW(
 
   configs.insert(configs.begin(),currentConfig);
 
+  int plannedGpuIterations = 0;
+  {
+    vector<OpenCLTuneParams> plannedConfigs = configs;
+    plannedConfigs.insert(plannedConfigs.begin(), referenceConfig);
+    dedupConfigsStable(plannedConfigs);
+    plannedGpuIterations = (int)plannedConfigs.size();
+  }
+  emitOpenclInitProbe(
+    logger,
+    "tuneHGemmWmmaNCHW iteration plan totalConfigs=" + std::to_string(plannedGpuIterations) +
+    " full=" + std::to_string(full ? 1 : 0)
+  );
+
+  int gpuTestCounter = 0;
+  static constexpr int kProgressEmitEvery = 1;
+  const auto tuningPhaseBegin = std::chrono::steady_clock::now();
+
   auto getDesc = [](const OpenCLTuneParams& cfg) { return cfg.hGemmWmmaNCHW.desc(); };
 
   auto test = [&](const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU) {
     OpenCLTuneAccums accums;
+    const auto configBegin = std::chrono::steady_clock::now();
+    int configIndex = -1;
+
+    if(!computeOnCPU) {
+      gpuTestCounter += 1;
+      configIndex = gpuTestCounter;
+      if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - tuningPhaseBegin
+        ).count();
+        const double avgPerConfigMs = gpuTestCounter > 0 ? (double)elapsedMs / (double)gpuTestCounter : 0.0;
+        const int remaining = std::max(0, plannedGpuIterations - gpuTestCounter);
+        const long long etaMs = (long long)(avgPerConfigMs * (double)remaining);
+        emitOpenclInitProbe(
+          logger,
+          "tuneHGemmWmmaNCHW progress tested=" + std::to_string(gpuTestCounter) +
+          "/" + std::to_string(plannedGpuIterations) +
+          " elapsedMs=" + std::to_string(elapsedMs) +
+          " avgPerConfigMs=" + std::to_string((long long)avgPerConfigMs) +
+          " etaMs=" + std::to_string(etaMs) +
+          " config=\"" + cfg.hGemmWmmaNCHW.desc() + "\""
+        );
+      }
+      emitOpenclInitProbe(
+        logger,
+        "tuneHGemmWmmaNCHW config begin tested=" + std::to_string(configIndex) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " config=\"" + cfg.hGemmWmmaNCHW.desc() + "\""
+      );
+    }
 
     cl_int err;
     cl_program program;
@@ -2049,6 +2514,19 @@ static bool tuneHGemmWmmaNCHW(
     clReleaseKernel(kernel);
     clReleaseProgram(program);
 
+    if(!computeOnCPU) {
+      const auto configElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - configBegin
+      ).count();
+      emitOpenclInitProbe(
+        logger,
+        "tuneHGemmWmmaNCHW config done tested=" + std::to_string(configIndex) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " durationMs=" + std::to_string(configElapsedMs) +
+        " status=" + std::string(accums.bad ? "bad" : "ok")
+      );
+    }
+
     return accums;
   };
 
@@ -2068,6 +2546,16 @@ static bool tuneHGemmWmmaNCHW(
     std::function<OpenCLTuneAccums(const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU)>(test),
     bestKernelsPerSecond
   );
+  const auto totalElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - tuningPhaseBegin
+  ).count();
+  emitOpenclInitProbe(
+    logger,
+    "tuneHGemmWmmaNCHW complete tested=" + std::to_string(gpuTestCounter) +
+    "/" + std::to_string(plannedGpuIterations) +
+    " elapsedMs=" + std::to_string(totalElapsedMs) +
+    " status=" + std::string(suc ? "ok" : "bad")
+  );
   if(suc) {
     tunedConfig = currentConfig;
   }
@@ -2086,6 +2574,7 @@ static void tuneTransform(
   int nnYLen,
   OpenCLTuner::ModelInfoForTuning modelInfo,
   bool full,
+  Logger* logger,
   ostream& out,
   const string& maybeFP16CompileOptions,
   bool verboseErrors,
@@ -2114,15 +2603,59 @@ static void tuneTransform(
   referenceConfig.conv3x3.transLocalSize0 = untunedConfig.conv3x3.transLocalSize0;
   referenceConfig.conv3x3.transLocalSize1 = untunedConfig.conv3x3.transLocalSize1;
 
+  int plannedGpuIterations = 0;
+  {
+    vector<OpenCLTuneParams> plannedConfigs = configs;
+    plannedConfigs.insert(plannedConfigs.begin(), referenceConfig);
+    dedupConfigsStable(plannedConfigs);
+    plannedGpuIterations = (int)plannedConfigs.size();
+  }
+  emitOpenclInitProbe(
+    logger,
+    "tuneTransform iteration plan totalConfigs=" + std::to_string(plannedGpuIterations) +
+    " full=" + std::to_string(full ? 1 : 0)
+  );
+
+  int gpuTestCounter = 0;
+  static constexpr int kProgressEmitEvery = 1;
+  const auto tuningPhaseBegin = std::chrono::steady_clock::now();
+
   auto getDesc = [](const OpenCLTuneParams& cfg) { return cfg.conv3x3.transDesc(); };
 
   auto test = [&](const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU) {
     OpenCLTuneAccums accums;
+    const auto configBegin = std::chrono::steady_clock::now();
+    int configIndex = -1;
     // We just let the reference config GPU impl be values that all values are compared for error against rather than a CPU impl
     if(computeOnCPU) {
       accums.bad = true;
       return accums;
     }
+    gpuTestCounter += 1;
+    configIndex = gpuTestCounter;
+    if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
+      const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - tuningPhaseBegin
+      ).count();
+      const double avgPerConfigMs = gpuTestCounter > 0 ? (double)elapsedMs / (double)gpuTestCounter : 0.0;
+      const int remaining = std::max(0, plannedGpuIterations - gpuTestCounter);
+      const long long etaMs = (long long)(avgPerConfigMs * (double)remaining);
+      emitOpenclInitProbe(
+        logger,
+        "tuneTransform progress tested=" + std::to_string(gpuTestCounter) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " elapsedMs=" + std::to_string(elapsedMs) +
+        " avgPerConfigMs=" + std::to_string((long long)avgPerConfigMs) +
+        " etaMs=" + std::to_string(etaMs) +
+        " config=\"" + cfg.conv3x3.transDesc() + "\""
+      );
+    }
+    emitOpenclInitProbe(
+      logger,
+      "tuneTransform config begin tested=" + std::to_string(configIndex) +
+      "/" + std::to_string(plannedGpuIterations) +
+      " config=\"" + cfg.conv3x3.transDesc() + "\""
+    );
 
     cl_int err;
     cl_program program;
@@ -2219,6 +2752,17 @@ static void tuneTransform(
     clReleaseKernel(kernel);
     clReleaseProgram(program);
 
+    const auto configElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - configBegin
+    ).count();
+    emitOpenclInitProbe(
+      logger,
+      "tuneTransform config done tested=" + std::to_string(configIndex) +
+      "/" + std::to_string(plannedGpuIterations) +
+      " durationMs=" + std::to_string(configElapsedMs) +
+      " status=" + std::string(accums.bad ? "bad" : "ok")
+    );
+
     return accums;
   };
 
@@ -2238,6 +2782,15 @@ static void tuneTransform(
     std::function<OpenCLTuneAccums(const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU)>(test),
     bestKernelsPerSecond
   );
+  const auto totalElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - tuningPhaseBegin
+  ).count();
+  emitOpenclInitProbe(
+    logger,
+    "tuneTransform complete tested=" + std::to_string(gpuTestCounter) +
+    "/" + std::to_string(plannedGpuIterations) +
+    " elapsedMs=" + std::to_string(totalElapsedMs)
+  );
 
   tunedConfig = currentConfig;
 }
@@ -2253,6 +2806,7 @@ static void tuneUntransform(
   int nnYLen,
   OpenCLTuner::ModelInfoForTuning modelInfo,
   bool full,
+  Logger* logger,
   ostream& out,
   const string& maybeFP16CompileOptions,
   bool verboseErrors,
@@ -2284,15 +2838,59 @@ static void tuneUntransform(
   referenceConfig.conv3x3.untransLocalSize1 = untunedConfig.conv3x3.untransLocalSize1;
   referenceConfig.conv3x3.untransLocalSize2 = untunedConfig.conv3x3.untransLocalSize2;
 
+  int plannedGpuIterations = 0;
+  {
+    vector<OpenCLTuneParams> plannedConfigs = configs;
+    plannedConfigs.insert(plannedConfigs.begin(), referenceConfig);
+    dedupConfigsStable(plannedConfigs);
+    plannedGpuIterations = (int)plannedConfigs.size();
+  }
+  emitOpenclInitProbe(
+    logger,
+    "tuneUntransform iteration plan totalConfigs=" + std::to_string(plannedGpuIterations) +
+    " full=" + std::to_string(full ? 1 : 0)
+  );
+
+  int gpuTestCounter = 0;
+  static constexpr int kProgressEmitEvery = 1;
+  const auto tuningPhaseBegin = std::chrono::steady_clock::now();
+
   auto getDesc = [](const OpenCLTuneParams& cfg) { return cfg.conv3x3.untransDesc(); };
 
   auto test = [&](const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU) {
     OpenCLTuneAccums accums;
+    const auto configBegin = std::chrono::steady_clock::now();
+    int configIndex = -1;
     // We just let the reference config GPU impl be values that all values are compared for error against rather than a CPU impl
     if(computeOnCPU) {
       accums.bad = true;
       return accums;
     }
+    gpuTestCounter += 1;
+    configIndex = gpuTestCounter;
+    if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
+      const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - tuningPhaseBegin
+      ).count();
+      const double avgPerConfigMs = gpuTestCounter > 0 ? (double)elapsedMs / (double)gpuTestCounter : 0.0;
+      const int remaining = std::max(0, plannedGpuIterations - gpuTestCounter);
+      const long long etaMs = (long long)(avgPerConfigMs * (double)remaining);
+      emitOpenclInitProbe(
+        logger,
+        "tuneUntransform progress tested=" + std::to_string(gpuTestCounter) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " elapsedMs=" + std::to_string(elapsedMs) +
+        " avgPerConfigMs=" + std::to_string((long long)avgPerConfigMs) +
+        " etaMs=" + std::to_string(etaMs) +
+        " config=\"" + cfg.conv3x3.untransDesc() + "\""
+      );
+    }
+    emitOpenclInitProbe(
+      logger,
+      "tuneUntransform config begin tested=" + std::to_string(configIndex) +
+      "/" + std::to_string(plannedGpuIterations) +
+      " config=\"" + cfg.conv3x3.untransDesc() + "\""
+    );
 
     cl_int err;
     cl_program program;
@@ -2389,6 +2987,17 @@ static void tuneUntransform(
     clReleaseKernel(kernel);
     clReleaseProgram(program);
 
+    const auto configElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - configBegin
+    ).count();
+    emitOpenclInitProbe(
+      logger,
+      "tuneUntransform config done tested=" + std::to_string(configIndex) +
+      "/" + std::to_string(plannedGpuIterations) +
+      " durationMs=" + std::to_string(configElapsedMs) +
+      " status=" + std::string(accums.bad ? "bad" : "ok")
+    );
+
     return accums;
   };
 
@@ -2408,6 +3017,15 @@ static void tuneUntransform(
     std::function<OpenCLTuneAccums(const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU)>(test),
     bestKernelsPerSecond
   );
+  const auto totalElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - tuningPhaseBegin
+  ).count();
+  emitOpenclInitProbe(
+    logger,
+    "tuneUntransform complete tested=" + std::to_string(gpuTestCounter) +
+    "/" + std::to_string(plannedGpuIterations) +
+    " elapsedMs=" + std::to_string(totalElapsedMs)
+  );
 
   tunedConfig = currentConfig;
 }
@@ -2423,6 +3041,7 @@ static void tuneGPool(
   int nnYLen,
   OpenCLTuner::ModelInfoForTuning modelInfo,
   bool full,
+  Logger* logger,
   ostream& out,
   const string& maybeFP16CompileOptions,
   bool verboseErrors,
@@ -2463,15 +3082,59 @@ static void tuneGPool(
   referenceConfig.gPool.CHANNELSTRIDE = untunedConfig.gPool.CHANNELSTRIDE;
   referenceConfig.gPool.BATCHSTRIDE = untunedConfig.gPool.BATCHSTRIDE;
 
+  int plannedGpuIterations = 0;
+  {
+    vector<OpenCLTuneParams> plannedConfigs = configs;
+    plannedConfigs.insert(plannedConfigs.begin(), referenceConfig);
+    dedupConfigsStable(plannedConfigs);
+    plannedGpuIterations = (int)plannedConfigs.size();
+  }
+  emitOpenclInitProbe(
+    logger,
+    "tuneGPool iteration plan totalConfigs=" + std::to_string(plannedGpuIterations) +
+    " full=" + std::to_string(full ? 1 : 0)
+  );
+
+  int gpuTestCounter = 0;
+  static constexpr int kProgressEmitEvery = 1;
+  const auto tuningPhaseBegin = std::chrono::steady_clock::now();
+
   auto getDesc = [](const OpenCLTuneParams& cfg) { return cfg.gPool.desc(); };
 
   auto test = [&](const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU) {
     OpenCLTuneAccums accums;
+    const auto configBegin = std::chrono::steady_clock::now();
+    int configIndex = -1;
     // We just let the reference config GPU impl be values that all values are compared for error against rather than a CPU impl
     if(computeOnCPU) {
       accums.bad = true;
       return accums;
     }
+    gpuTestCounter += 1;
+    configIndex = gpuTestCounter;
+    if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
+      const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - tuningPhaseBegin
+      ).count();
+      const double avgPerConfigMs = gpuTestCounter > 0 ? (double)elapsedMs / (double)gpuTestCounter : 0.0;
+      const int remaining = std::max(0, plannedGpuIterations - gpuTestCounter);
+      const long long etaMs = (long long)(avgPerConfigMs * (double)remaining);
+      emitOpenclInitProbe(
+        logger,
+        "tuneGPool progress tested=" + std::to_string(gpuTestCounter) +
+        "/" + std::to_string(plannedGpuIterations) +
+        " elapsedMs=" + std::to_string(elapsedMs) +
+        " avgPerConfigMs=" + std::to_string((long long)avgPerConfigMs) +
+        " etaMs=" + std::to_string(etaMs) +
+        " config=\"" + cfg.gPool.desc() + "\""
+      );
+    }
+    emitOpenclInitProbe(
+      logger,
+      "tuneGPool config begin tested=" + std::to_string(configIndex) +
+      "/" + std::to_string(plannedGpuIterations) +
+      " config=\"" + cfg.gPool.desc() + "\""
+    );
 
     cl_int err;
     cl_program program;
@@ -2538,6 +3201,17 @@ static void tuneGPool(
     clReleaseKernel(kernel);
     clReleaseProgram(program);
 
+    const auto configElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - configBegin
+    ).count();
+    emitOpenclInitProbe(
+      logger,
+      "tuneGPool config done tested=" + std::to_string(configIndex) +
+      "/" + std::to_string(plannedGpuIterations) +
+      " durationMs=" + std::to_string(configElapsedMs) +
+      " status=" + std::string(accums.bad ? "bad" : "ok")
+    );
+
     return accums;
   };
 
@@ -2556,6 +3230,15 @@ static void tuneGPool(
     std::function<string(const OpenCLTuneParams& cfg)>(getDesc),
     std::function<OpenCLTuneAccums(const OpenCLTuneParams& cfg, vector<float>& ret, bool computeOnCPU)>(test),
     bestKernelsPerSecond
+  );
+  const auto totalElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - tuningPhaseBegin
+  ).count();
+  emitOpenclInitProbe(
+    logger,
+    "tuneGPool complete tested=" + std::to_string(gpuTestCounter) +
+    "/" + std::to_string(plannedGpuIterations) +
+    " elapsedMs=" + std::to_string(totalElapsedMs)
   );
 
   tunedConfig = currentConfig;
@@ -2583,162 +3266,174 @@ static void dummyThreadLoop(
     logger->write("Dummy tuning thread starting");
   }
 
-  const bool enableProfiling = false;
-  DevicesContext devicesContext(allDeviceInfos, {gpuIdxForTuning}, logger, enableProfiling);
+  try {
+    const bool enableProfiling = false;
+    DevicesContext devicesContext(allDeviceInfos, {gpuIdxForTuning}, logger, enableProfiling);
 
-  const InitializedDevice* device = devicesContext.findGpuExn(gpuIdxForTuning);
-  const cl_context& context = device->context;
-  cl_command_queue commandQueue = device->commandQueue;
-  const vector<cl_device_id>& deviceIdsToUse = { device->info.deviceId };
+    const InitializedDevice* device = devicesContext.findGpuExn(gpuIdxForTuning);
+    const cl_context& context = device->context;
+    cl_command_queue commandQueue = device->commandQueue;
+    const vector<cl_device_id>& deviceIdsToUse = { device->info.deviceId };
 
-  OpenCLTuneParams cfg;
-  cfg.xGemmDirect.MDIMCD = 8;
-  cfg.xGemmDirect.NDIMCD = 8;
-  cfg.xGemmDirect.MDIMAD = 8;
-  cfg.xGemmDirect.NDIMBD = 8;
+    OpenCLTuneParams cfg;
+    cfg.xGemmDirect.MDIMCD = 8;
+    cfg.xGemmDirect.NDIMCD = 8;
+    cfg.xGemmDirect.MDIMAD = 8;
+    cfg.xGemmDirect.NDIMBD = 8;
 
-  cl_int err;
-  string compileError;
-  bool compileSuc;
+    cl_int err;
+    string compileError;
+    bool compileSuc;
 
-  cl_program xGemmProgram;
-  compileSuc = tryCompileProgram(
-    "xgemmDirectProgram", context, deviceIdsToUse, OpenCLKernels::xgemmDirect,
-    cfg.xGemmDirect.compileOptions() + " -DROUTINE_GEMMSTRIDEDBATCHED",
-    xGemmProgram, compileError
-  );
-  if(!compileSuc) {
-    reportFailure("Compile error: " + compileError);
+    cl_program xGemmProgram;
+    compileSuc = tryCompileProgram(
+      "xgemmDirectProgram", context, deviceIdsToUse, OpenCLKernels::xgemmDirect,
+      cfg.xGemmDirect.compileOptions() + " -DROUTINE_GEMMSTRIDEDBATCHED",
+      xGemmProgram, compileError
+    );
+    if(!compileSuc) {
+      reportFailure("Compile error: " + compileError);
+      dummyInitializedOrDeadFlag.setPermanently(true);
+      return;
+    }
+
+    cl_program addPointWiseProgram;
+    compileSuc = tryCompileProgram(
+      "addPointWiseProgram", context, deviceIdsToUse, OpenCLKernels::addPointWise,
+      string(), addPointWiseProgram, compileError
+    );
+    if(!compileSuc) {
+      reportFailure("Compile error: " + compileError);
+      dummyInitializedOrDeadFlag.setPermanently(true);
+      return;
+    }
+
+    cl_kernel xGemmKernel = clCreateKernel(xGemmProgram, "XgemmDirectStridedBatchedNN", &err);
+    if(err != 0) {
+      reportFailure("createKernel error code " + Global::intToString(err));
+      dummyInitializedOrDeadFlag.setPermanently(true);
+      return;
+    }
+    cl_kernel addPointWiseKernel = clCreateKernel(addPointWiseProgram, "addPointWise", &err);
+    if(err != 0) {
+      reportFailure("createKernel error code " + Global::intToString(err));
+      dummyInitializedOrDeadFlag.setPermanently(true);
+      return;
+    }
+
+    const int batchSize = 1;
+    const int mSize = 97;
+    const int kSize = 151;
+
+    vector<float> matrixAVec;
+    vector<float> matrixBVec;
+    vector<float> matrixCVec;
+    vector<float> matrixDVec;
+    cl_mem matrixA = randomReadOnlyBufferFloat("dummyThreadA", context, kSize*kSize, 1.2 / kSize, matrixAVec);
+    cl_mem matrixB = randomReadOnlyBufferFloat("dummyThreadB", context, kSize*kSize, 1.2 / kSize, matrixBVec);
+    cl_mem matrixC = randomReadOnlyBufferFloat("dummyThreadC", context, mSize*kSize, 1.0, matrixCVec);
+    cl_mem matrixD = randomReadOnlyBufferFloat("dummyThreadD", context, mSize*kSize, 1.0, matrixDVec);
+    cl_mem buffer = createReadWriteBufferFloatZeros(context, mSize*kSize);
+    cl_mem buffer2 = createReadWriteBufferFloatZeros(context, mSize*kSize);
+
+    vector<float> output(mSize*kSize, 0.0f);
+
+    // Batch size 1, so no strides
+    int aStride = 0;
+    int bStride = 0;
+    int cStride = 0;
+
+    Rand rand("dummyThreadLoop");
+    dummyInitializedOrDeadFlag.setPermanently(true);
+
+    double total = 0.0;
+    bool first = true;
+    while(!dummyShouldStopFlag.get()) {
+      int which = rand.nextInt(0,6);
+      if(first) {
+        which = 4;
+        first = false;
+      }
+      if(which == 0 || which == 1 || which == 2 || which == 3) {
+        cl_event event;
+        err = doStridedBatchedXGemmDirect_KM_KN_NM(
+          xGemmKernel,
+          commandQueue,
+          cfg,
+          mSize, kSize, kSize,
+          aStride, bStride, cStride,
+          buffer, ((which == 0 || which == 1) ? matrixA : matrixB), buffer2,
+          batchSize,
+          &event
+        );
+
+        if(err != 0) {
+          reportFailure("doStridedBatchedXGemmDirect_KM_KN_NM error code " + Global::intToString(err));
+          return;
+        }
+        err = clWaitForEvents(1, &event);
+        //If the kernel does bad things the error might also pop up here
+        if(err != 0) {
+          reportFailure("doStridedBatchedXGemmDirect_KM_KN_NM error code " + Global::intToString(err));
+          return;
+        }
+
+        clReleaseEvent(event);
+        std::swap(buffer,buffer2);
+      }
+      else if(which == 4 || which == 5) {
+        cl_event event;
+        err = OpenCLHelpers::doAddPointWise(
+          addPointWiseKernel, commandQueue, buffer, (which == 4 ? matrixC : matrixD), mSize*kSize, &event
+        );
+
+        if(err != 0) {
+          reportFailure("doStridedBatchedXGemmDirect_KM_KN_NM error code " + Global::intToString(err));
+          return;
+        }
+        err = clWaitForEvents(1, &event);
+        //If the kernel does bad things the error might also pop up here
+        if(err != 0) {
+          reportFailure("doStridedBatchedXGemmDirect_KM_KN_NM error code " + Global::intToString(err));
+          return;
+        }
+        clReleaseEvent(event);
+      }
+      else {
+        blockingReadBuffer(commandQueue, buffer, mSize*kSize, output.data());
+        float subTotal = 0.0f;
+        for(int i = 0; i<mSize*kSize; i++)
+          subTotal += output[i];
+        total += (double)subTotal;
+      }
+    }
+    (void)total;
+    if(logger != NULL)
+      logger->write("Tuning dummy thread numeric total: " + Global::doubleToString(total));
+
+
+    clReleaseMemObject(matrixA);
+    clReleaseMemObject(matrixB);
+    clReleaseMemObject(matrixC);
+    clReleaseMemObject(matrixD);
+    clReleaseMemObject(buffer);
+    clReleaseMemObject(buffer2);
+
+    clReleaseKernel(addPointWiseKernel);
+    clReleaseKernel(xGemmKernel);
+    clReleaseProgram(addPointWiseProgram);
+    clReleaseProgram(xGemmProgram);
+  }
+  catch(const std::exception& e) {
+    reportFailure(string("dummy_thread_exception std::exception: ") + e.what());
     dummyInitializedOrDeadFlag.setPermanently(true);
     return;
   }
-
-  cl_program addPointWiseProgram;
-  compileSuc = tryCompileProgram(
-    "addPointWiseProgram", context, deviceIdsToUse, OpenCLKernels::addPointWise,
-    string(), addPointWiseProgram, compileError
-  );
-  if(!compileSuc) {
-    reportFailure("Compile error: " + compileError);
+  catch(...) {
+    reportFailure("dummy_thread_exception unknown_exception");
     dummyInitializedOrDeadFlag.setPermanently(true);
     return;
   }
-
-  cl_kernel xGemmKernel = clCreateKernel(xGemmProgram, "XgemmDirectStridedBatchedNN", &err);
-  if(err != 0) {
-    reportFailure("createKernel error code " + Global::intToString(err));
-    dummyInitializedOrDeadFlag.setPermanently(true);
-    return;
-  }
-  cl_kernel addPointWiseKernel = clCreateKernel(addPointWiseProgram, "addPointWise", &err);
-  if(err != 0) {
-    reportFailure("createKernel error code " + Global::intToString(err));
-    dummyInitializedOrDeadFlag.setPermanently(true);
-    return;
-  }
-
-  const int batchSize = 1;
-  const int mSize = 97;
-  const int kSize = 151;
-
-  vector<float> matrixAVec;
-  vector<float> matrixBVec;
-  vector<float> matrixCVec;
-  vector<float> matrixDVec;
-  cl_mem matrixA = randomReadOnlyBufferFloat("dummyThreadA", context, kSize*kSize, 1.2 / kSize, matrixAVec);
-  cl_mem matrixB = randomReadOnlyBufferFloat("dummyThreadB", context, kSize*kSize, 1.2 / kSize, matrixBVec);
-  cl_mem matrixC = randomReadOnlyBufferFloat("dummyThreadC", context, mSize*kSize, 1.0, matrixCVec);
-  cl_mem matrixD = randomReadOnlyBufferFloat("dummyThreadD", context, mSize*kSize, 1.0, matrixDVec);
-  cl_mem buffer = createReadWriteBufferFloatZeros(context, mSize*kSize);
-  cl_mem buffer2 = createReadWriteBufferFloatZeros(context, mSize*kSize);
-
-  vector<float> output(mSize*kSize, 0.0f);
-
-  // Batch size 1, so no strides
-  int aStride = 0;
-  int bStride = 0;
-  int cStride = 0;
-
-  Rand rand("dummyThreadLoop");
-  dummyInitializedOrDeadFlag.setPermanently(true);
-
-  double total = 0.0;
-  bool first = true;
-  while(!dummyShouldStopFlag.get()) {
-    int which = rand.nextInt(0,6);
-    if(first) {
-      which = 4;
-      first = false;
-    }
-    if(which == 0 || which == 1 || which == 2 || which == 3) {
-      cl_event event;
-      err = doStridedBatchedXGemmDirect_KM_KN_NM(
-        xGemmKernel,
-        commandQueue,
-        cfg,
-        mSize, kSize, kSize,
-        aStride, bStride, cStride,
-        buffer, ((which == 0 || which == 1) ? matrixA : matrixB), buffer2,
-        batchSize,
-        &event
-      );
-
-      if(err != 0) {
-        reportFailure("doStridedBatchedXGemmDirect_KM_KN_NM error code " + Global::intToString(err));
-        return;
-      }
-      err = clWaitForEvents(1, &event);
-      //If the kernel does bad things the error might also pop up here
-      if(err != 0) {
-        reportFailure("doStridedBatchedXGemmDirect_KM_KN_NM error code " + Global::intToString(err));
-        return;
-      }
-
-      clReleaseEvent(event);
-      std::swap(buffer,buffer2);
-    }
-    else if(which == 4 || which == 5) {
-      cl_event event;
-      err = OpenCLHelpers::doAddPointWise(
-        addPointWiseKernel, commandQueue, buffer, (which == 4 ? matrixC : matrixD), mSize*kSize, &event
-      );
-
-      if(err != 0) {
-        reportFailure("doStridedBatchedXGemmDirect_KM_KN_NM error code " + Global::intToString(err));
-        return;
-      }
-      err = clWaitForEvents(1, &event);
-      //If the kernel does bad things the error might also pop up here
-      if(err != 0) {
-        reportFailure("doStridedBatchedXGemmDirect_KM_KN_NM error code " + Global::intToString(err));
-        return;
-      }
-      clReleaseEvent(event);
-    }
-    else {
-      blockingReadBuffer(commandQueue, buffer, mSize*kSize, output.data());
-      float subTotal = 0.0f;
-      for(int i = 0; i<mSize*kSize; i++)
-        subTotal += output[i];
-      total += (double)subTotal;
-    }
-  }
-  (void)total;
-  if(logger != NULL)
-    logger->write("Tuning dummy thread numeric total: " + Global::doubleToString(total));
-
-
-  clReleaseMemObject(matrixA);
-  clReleaseMemObject(matrixB);
-  clReleaseMemObject(matrixC);
-  clReleaseMemObject(matrixD);
-  clReleaseMemObject(buffer);
-  clReleaseMemObject(buffer2);
-
-  clReleaseKernel(addPointWiseKernel);
-  clReleaseKernel(xGemmKernel);
-  clReleaseProgram(addPointWiseProgram);
-  clReleaseProgram(xGemmProgram);
 
   return;
 }
@@ -2766,15 +3461,27 @@ void OpenCLTuner::tune(
   bool verboseTuner,
   OpenCLTuneParams& tunedConfig
 ) {
+  const auto tuneBegin = std::chrono::steady_clock::now();
   const InitializedDevice* device = devicesContext.findGpuExn(gpuIdx);
   const cl_context& context = device->context;
   cl_command_queue commandQueue = device->commandQueue;
   const vector<cl_device_id>& deviceIdsToUse = { device->info.deviceId };
 
+  emitOpenclInitProbe(
+    logger,
+    "tune begin gpuIdx=" + std::to_string(gpuIdx) +
+    " deviceName=" + device->info.name +
+    " nnXLen=" + std::to_string(nnXLen) +
+    " nnYLen=" + std::to_string(nnYLen) +
+    " batchSize=" + std::to_string(batchSize)
+  );
+
   out << "Beginning GPU tuning for " << device->info.name << " modelVersion " << modelInfo.modelVersion << " channels " << modelInfo.trunkNumChannels << endl;
 
   // Start a dummy thread to put a bunch of load on the GPU, so that we can encourage dynamic-clock-speed GPUs
   // to stay at a high setting during the tuning.
+  emitOpenclInitProbe(logger, "tune stage begin stage=dummy_thread_start");
+  const auto dummyStartBegin = std::chrono::steady_clock::now();
   WaitableFlag dummyInitializedOrDeadFlag;
   WaitableFlag dummyShouldStopFlag;
   std::thread dummyThread(
@@ -2786,6 +3493,10 @@ void OpenCLTuner::tune(
     std::ref(dummyShouldStopFlag)
   );
   dummyInitializedOrDeadFlag.waitUntilTrue();
+  const auto dummyStartElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - dummyStartBegin
+  ).count();
+  emitOpenclInitProbe(logger, "tune stage done stage=dummy_thread_start durationMs=" + std::to_string(dummyStartElapsedMs));
 
   OpenCLTuneParams untunedConfig = OpenCLTuneParams();
   OpenCLTuneParams currentConfig = initialConfig;
@@ -2820,6 +3531,8 @@ void OpenCLTuner::tune(
 
   double bestXGemmDirectKernelsPerSecond = 0.0;
   {
+    emitOpenclInitProbe(logger, "tune stage begin stage=tuneXGemmDirect");
+    const auto stageBegin = std::chrono::steady_clock::now();
     OpenCLTuneParams result;
     tuneXGemmDirect(
       currentConfig,
@@ -2832,6 +3545,7 @@ void OpenCLTuner::tune(
       nnYLen,
       modelInfo,
       full,
+      logger,
       out,
       verboseErrors,
       verboseTuner,
@@ -2839,13 +3553,21 @@ void OpenCLTuner::tune(
       bestXGemmDirectKernelsPerSecond
     );
     currentConfig = result;
+    const auto stageElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - stageBegin
+    ).count();
+    emitOpenclInitProbe(logger, "tune stage done stage=tuneXGemmDirect durationMs=" + std::to_string(stageElapsedMs));
   }
 
   {
+    emitOpenclInitProbe(logger, "tune stage begin stage=tuneXGemm_and_fp16");
+    const auto stageBegin = std::chrono::steady_clock::now();
     OpenCLTuneParams result;
     bool useFP16Storage = false;
     double bestKernelsPerSecond = 0.0;
-    tuneXGemm(
+    emitOpenclInitProbe(logger, "tune substage begin stage=tuneXGemm_fp32");
+    const auto substageBegin = std::chrono::steady_clock::now();
+    const bool baselineSuc = tuneXGemm(
       currentConfig,
       untunedConfig,
       context,
@@ -2856,12 +3578,21 @@ void OpenCLTuner::tune(
       nnYLen,
       modelInfo,
       full,
+      logger,
       out,
       useFP16Storage,
       verboseErrors,
       verboseTuner,
       result,
       bestKernelsPerSecond
+    );
+    const auto substageElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - substageBegin
+    ).count();
+    emitOpenclInitProbe(
+      logger,
+      "tune substage done stage=tuneXGemm_fp32 durationMs=" + std::to_string(substageElapsedMs) +
+      " status=" + std::string(baselineSuc ? "ok" : "bad")
     );
     currentConfig = result;
 
@@ -2880,6 +3611,7 @@ void OpenCLTuner::tune(
     bool shouldTestFP16 = testFP16Mode != enabled_t::False;
     //Try FP16 if allowed
     if(!shouldTestFP16) {
+      emitOpenclInitProbe(logger, "tune substage skip stage=fp16_group reason=fp16_disabled");
       out << "Not enabling FP16 for anything since FP16 disabled" << endl;
     }
     else {
@@ -2894,6 +3626,8 @@ void OpenCLTuner::tune(
       bool shouldTestFP16TensorCores = testFP16TensorCoresMode == enabled_t::True || (testFP16TensorCoresMode == enabled_t::Auto && !foundGoodFP16);
       if(shouldTestFP16TensorCores) {
         {
+          emitOpenclInitProbe(logger, "tune substage begin stage=tuneHGemmWmma");
+          const auto substageBegin = std::chrono::steady_clock::now();
           OpenCLTuneParams result16;
           double bestKernelsPerSecond16 = 0.0;
           bool suc = tuneHGemmWmma(
@@ -2907,11 +3641,20 @@ void OpenCLTuner::tune(
             nnYLen,
             modelInfo,
             full,
+            logger,
             out,
             verboseErrors,
             verboseTuner,
             result16,
             bestKernelsPerSecond16
+          );
+          const auto substageElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - substageBegin
+          ).count();
+          emitOpenclInitProbe(
+            logger,
+            "tune substage done stage=tuneHGemmWmma durationMs=" + std::to_string(substageElapsedMs) +
+            " status=" + std::string(suc ? "ok" : "bad")
           );
           if(!suc) {
             out << "FP16 tensor core tuning failed, assuming no FP16 tensor core support" << endl;
@@ -2934,6 +3677,8 @@ void OpenCLTuner::tune(
           }
         }
         {
+          emitOpenclInitProbe(logger, "tune substage begin stage=tuneHGemmWmmaNCHW");
+          const auto substageBegin = std::chrono::steady_clock::now();
           // Also try tuning FP16 tensor cores for 1x1 convs
           OpenCLTuneParams result16;
           double bestKernelsPerSecond16 = 0.0;
@@ -2948,11 +3693,20 @@ void OpenCLTuner::tune(
             nnYLen,
             modelInfo,
             full,
+            logger,
             out,
             verboseErrors,
             verboseTuner,
             result16,
             bestKernelsPerSecond16
+          );
+          const auto substageElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - substageBegin
+          ).count();
+          emitOpenclInitProbe(
+            logger,
+            "tune substage done stage=tuneHGemmWmmaNCHW durationMs=" + std::to_string(substageElapsedMs) +
+            " status=" + std::string(suc ? "ok" : "bad")
           );
           if(!suc) {
             out << "FP16 tensor core tuning failed for 1x1 convs" << endl;
@@ -2974,9 +3728,14 @@ void OpenCLTuner::tune(
           }
         }
       }
+      else {
+        emitOpenclInitProbe(logger, "tune substage skip stage=tuneHGemmWmma reason=fp16_tensor_cores_disabled");
+      }
 
       bool shouldTestFP16Compute = testFP16ComputeMode == enabled_t::True || (testFP16ComputeMode == enabled_t::Auto && device->info.supportsFP16Compute);
       if(shouldTestFP16Compute) {
+        emitOpenclInitProbe(logger, "tune substage begin stage=tuneXGemm16");
+        const auto substageBegin = std::chrono::steady_clock::now();
         OpenCLTuneParams result16;
         double bestKernelsPerSecond16 = 0.0;
         bool suc = tuneXGemm16(
@@ -2990,11 +3749,20 @@ void OpenCLTuner::tune(
           nnYLen,
           modelInfo,
           full,
+          logger,
           out,
           verboseErrors,
           verboseTuner,
           result16,
           bestKernelsPerSecond16
+        );
+        const auto substageElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - substageBegin
+        ).count();
+        emitOpenclInitProbe(
+          logger,
+          "tune substage done stage=tuneXGemm16 durationMs=" + std::to_string(substageElapsedMs) +
+          " status=" + std::string(suc ? "ok" : "bad")
         );
 
         if(!suc) {
@@ -3024,9 +3792,14 @@ void OpenCLTuner::tune(
           out << "Enabling FP16 compute due to better performance" << endl;
         }
       }
+      else {
+        emitOpenclInitProbe(logger, "tune substage skip stage=tuneXGemm16 reason=fp16_compute_disabled");
+      }
 
       bool shouldTestFP16Storage = testFP16StorageMode == enabled_t::True || (testFP16StorageMode == enabled_t::Auto && !foundGoodFP16);
       if(shouldTestFP16Storage) {
+        emitOpenclInitProbe(logger, "tune substage begin stage=tuneXGemm_fp16_storage");
+        const auto substageBegin = std::chrono::steady_clock::now();
         OpenCLTuneParams result16;
         bool useFP16Storage16 = true;
         double bestKernelsPerSecond16 = 0.0;
@@ -3041,12 +3814,21 @@ void OpenCLTuner::tune(
           nnYLen,
           modelInfo,
           full,
+          logger,
           out,
           useFP16Storage16,
           verboseErrors,
           verboseTuner,
           result16,
           bestKernelsPerSecond16
+        );
+        const auto substageElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - substageBegin
+        ).count();
+        emitOpenclInitProbe(
+          logger,
+          "tune substage done stage=tuneXGemm_fp16_storage durationMs=" + std::to_string(substageElapsedMs) +
+          " status=" + std::string(suc ? "ok" : "bad")
         );
 
         if(!suc) {
@@ -3067,7 +3849,14 @@ void OpenCLTuner::tune(
           out << "Enabling FP16 storage due to better performance" << endl;
         }
       }
+      else {
+        emitOpenclInitProbe(logger, "tune substage skip stage=tuneXGemm_fp16_storage reason=fp16_storage_disabled");
+      }
     }
+    const auto stageElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - stageBegin
+    ).count();
+    emitOpenclInitProbe(logger, "tune stage done stage=tuneXGemm_and_fp16 durationMs=" + std::to_string(stageElapsedMs));
   }
 
   out << "------------------------------------------------------" << endl;
@@ -3092,6 +3881,8 @@ void OpenCLTuner::tune(
 
 
   {
+    emitOpenclInitProbe(logger, "tune stage begin stage=tuneTransform");
+    const auto stageBegin = std::chrono::steady_clock::now();
     OpenCLTuneParams result;
     tuneTransform(
       currentConfig,
@@ -3104,6 +3895,7 @@ void OpenCLTuner::tune(
       nnYLen,
       modelInfo,
       full,
+      logger,
       out,
       maybeFP16CompileOptions,
       verboseErrors,
@@ -3111,9 +3903,15 @@ void OpenCLTuner::tune(
       result
     );
     currentConfig = result;
+    const auto stageElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - stageBegin
+    ).count();
+    emitOpenclInitProbe(logger, "tune stage done stage=tuneTransform durationMs=" + std::to_string(stageElapsedMs));
   }
 
   {
+    emitOpenclInitProbe(logger, "tune stage begin stage=tuneUntransform");
+    const auto stageBegin = std::chrono::steady_clock::now();
     OpenCLTuneParams result;
     tuneUntransform(
       currentConfig,
@@ -3126,6 +3924,7 @@ void OpenCLTuner::tune(
       nnYLen,
       modelInfo,
       full,
+      logger,
       out,
       maybeFP16CompileOptions,
       verboseErrors,
@@ -3133,9 +3932,15 @@ void OpenCLTuner::tune(
       result
     );
     currentConfig = result;
+    const auto stageElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - stageBegin
+    ).count();
+    emitOpenclInitProbe(logger, "tune stage done stage=tuneUntransform durationMs=" + std::to_string(stageElapsedMs));
   }
 
   {
+    emitOpenclInitProbe(logger, "tune stage begin stage=tuneGPool");
+    const auto stageBegin = std::chrono::steady_clock::now();
     OpenCLTuneParams result;
     tuneGPool(
       currentConfig,
@@ -3148,6 +3953,7 @@ void OpenCLTuner::tune(
       nnYLen,
       modelInfo,
       full,
+      logger,
       out,
       maybeFP16CompileOptions,
       verboseErrors,
@@ -3155,6 +3961,10 @@ void OpenCLTuner::tune(
       result
     );
     currentConfig = result;
+    const auto stageElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - stageBegin
+    ).count();
+    emitOpenclInitProbe(logger, "tune stage done stage=tuneGPool durationMs=" + std::to_string(stageElapsedMs));
 
   }
 
@@ -3166,12 +3976,22 @@ void OpenCLTuner::tune(
   currentConfig.conv5x5.untransLocalSize1 = currentConfig.conv3x3.untransLocalSize1;
   currentConfig.conv5x5.untransLocalSize2 = currentConfig.conv3x3.untransLocalSize2;
 
+  emitOpenclInitProbe(logger, "tune stage begin stage=dummy_thread_stop");
+  const auto dummyStopBegin = std::chrono::steady_clock::now();
   dummyShouldStopFlag.setPermanently(true);
   dummyThread.join();
+  const auto dummyStopElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - dummyStopBegin
+  ).count();
+  emitOpenclInitProbe(logger, "tune stage done stage=dummy_thread_stop durationMs=" + std::to_string(dummyStopElapsedMs));
 
   out << "Done tuning" << endl;
   out << "------------------------------------------------------" << endl;
   tunedConfig = currentConfig;
+  const auto tuneElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - tuneBegin
+  ).count();
+  emitOpenclInitProbe(logger, "tune done durationMs=" + std::to_string(tuneElapsedMs));
 }
 
 string OpenCLTuner::defaultDirectory(bool makeDir, const string& homeDataDirOverride) {
@@ -3225,20 +4045,34 @@ OpenCLTuneParams OpenCLTuner::loadOrAutoTune(
   OpenCLTuner::ModelInfoForTuning modelInfo,
   bool full
 ) {
+  const auto loadOrTuneBegin = std::chrono::steady_clock::now();
+  emitOpenclInitProbe(
+    logger,
+    "loadOrAutoTune begin gpuName=" + gpuName +
+    " gpuIdx=" + std::to_string(gpuIdxForTuning) +
+    " nnXLen=" + std::to_string(nnXLen) +
+    " nnYLen=" + std::to_string(nnYLen) +
+    " openclReTunePerBoardSize=" + std::to_string(openCLReTunePerBoardSize ? 1 : 0)
+  );
+
   if(openCLTunerFile != "") {
+    emitOpenclInitProbe(logger, "loadOrAutoTune explicit tuner file path provided");
     return loadFromTunerFile(openCLTunerFile,logger);
   }
 
   string dir = OpenCLTuner::defaultDirectory(true,homeDataDirOverride);
   openCLTunerFile = dir + "/" + OpenCLTuner::defaultFileName(gpuName, nnXLen, nnYLen, modelInfo);
+  emitOpenclInitProbe(logger, "loadOrAutoTune lookup primary file " + openCLTunerFile);
 
   //Try loading the config for the proper size
   try {
     OpenCLTuneParams loadedParams = loadFromTunerFile(openCLTunerFile,logger);
+    emitOpenclInitProbe(logger, "loadOrAutoTune hit primary file");
     return loadedParams;
   }
   catch(const StringError& e) {
     (void)e;
+    emitOpenclInitProbe(logger, "loadOrAutoTune miss primary file");
   };
 
   //If not re-tuning per board size, then check if the tune config for the full size is there
@@ -3247,12 +4081,15 @@ OpenCLTuneParams OpenCLTuner::loadOrAutoTune(
     nnXLen = NNPos::MAX_BOARD_LEN;
     nnYLen = NNPos::MAX_BOARD_LEN;
     openCLTunerFile = dir + "/" + OpenCLTuner::defaultFileName(gpuName, nnXLen, nnYLen, modelInfo);
+    emitOpenclInitProbe(logger, "loadOrAutoTune lookup fallback full-board file " + openCLTunerFile);
     try {
       OpenCLTuneParams loadedParams = loadFromTunerFile(openCLTunerFile,logger);
+      emitOpenclInitProbe(logger, "loadOrAutoTune hit fallback full-board file");
       return loadedParams;
     }
     catch(const StringError& e) {
       (void)e;
+      emitOpenclInitProbe(logger, "loadOrAutoTune miss fallback full-board file");
     };
   }
 
@@ -3278,13 +4115,17 @@ OpenCLTuneParams OpenCLTuner::loadOrAutoTune(
     );
 
   bool enableProfiling = true;
+  emitOpenclInitProbe(logger, "loadOrAutoTune creating DevicesContext for autotune");
   DevicesContext devicesContext(allDeviceInfos, {gpuIdxForTuning}, logger, enableProfiling);
+  emitOpenclInitProbe(logger, "loadOrAutoTune DevicesContext ready");
 
   OpenCLTuneParams initialParams;
   int batchSize = OpenCLTuner::DEFAULT_BATCH_SIZE;
   bool verboseErrors = false;
   bool verboseTuner = false;
   OpenCLTuneParams results;
+  emitOpenclInitProbe(logger, "loadOrAutoTune autotune begin");
+  const auto autotuneBegin = std::chrono::steady_clock::now();
   OpenCLTuner::tune(
     initialParams,
     allDeviceInfos,
@@ -3306,13 +4147,23 @@ OpenCLTuneParams OpenCLTuner::loadOrAutoTune(
     verboseTuner,
     results
   );
+  const auto autotuneElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - autotuneBegin
+  ).count();
+  emitOpenclInitProbe(logger, "loadOrAutoTune autotune done durationMs=" + std::to_string(autotuneElapsedMs));
 
+  emitOpenclInitProbe(logger, "loadOrAutoTune saving file " + openCLTunerFile);
   OpenCLTuneParams::save(openCLTunerFile, results);
+  emitOpenclInitProbe(logger, "loadOrAutoTune save complete");
   if(logger != NULL)
     logger->write("Done tuning, saved results to " + openCLTunerFile);
   if(logger == NULL || (!logger->isLoggingToStdout() && !logger->isLoggingToStderr()))
     cerr << "Done tuning, saved results to " << openCLTunerFile << endl;
 
+  const auto totalElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - loadOrTuneBegin
+  ).count();
+  emitOpenclInitProbe(logger, "loadOrAutoTune done durationMs=" + std::to_string(totalElapsedMs));
   return results;
 
 }
