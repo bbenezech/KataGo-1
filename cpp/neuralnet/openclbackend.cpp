@@ -8,6 +8,7 @@
 #include "../neuralnet/modelversion.h"
 #include "../neuralnet/openclkernels.h"
 #include "../neuralnet/opencltuner.h"
+#include "../neuralnet/opencltuningprogress.h"
 #include "../neuralnet/activations.h"
 
 #include "../neuralnet/openclhelpers.h"
@@ -457,6 +458,13 @@ struct ComputeContext {
         useFP16Compute = tuneParams.shouldUseFP16Compute;
         useFP16TensorCores = tuneParams.shouldUseFP16TensorCores;
         useFP16TensorCoresFor1x1 = tuneParams.shouldUseFP16TensorCoresFor1x1;
+      }
+
+      {
+        OpenCLTuningProgress* p = OpenCLTuningProgress::getCurrent();
+        if(p != nullptr) {
+          p->setDeviceInfo(name, useFP16Storage, useFP16Compute, useFP16TensorCores);
+        }
       }
 
       emitOpenclInitProbe(

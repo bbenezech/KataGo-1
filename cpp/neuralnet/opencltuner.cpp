@@ -2,6 +2,7 @@
 
 #include "../neuralnet/openclhelpers.h"
 #include "../neuralnet/opencltuner.h"
+#include "../neuralnet/opencltuningprogress.h"
 #include "../neuralnet/openclkernels.h"
 #include "../neuralnet/modelversion.h"
 #include "../core/fileutils.h"
@@ -35,6 +36,24 @@ void emitOpenclInitProbe(Logger* logger, const string& message) {
 #ifdef __ANDROID__
   __android_log_print(ANDROID_LOG_INFO, "KataGoOpenCLInit", "%s", message.c_str());
 #endif
+}
+
+void progressBeginStage(const string& stageName) {
+  OpenCLTuningProgress* p = OpenCLTuningProgress::getCurrent();
+  if(p != nullptr)
+    p->beginStage(stageName);
+}
+
+void progressCompleteStage(const string& stageName, const string& status) {
+  OpenCLTuningProgress* p = OpenCLTuningProgress::getCurrent();
+  if(p != nullptr)
+    p->completeStage(stageName, status);
+}
+
+void progressUpdateConfig(int tested, int total) {
+  OpenCLTuningProgress* p = OpenCLTuningProgress::getCurrent();
+  if(p != nullptr)
+    p->updateConfigProgress(tested, total);
 }
 
 }
@@ -1150,6 +1169,7 @@ static void tuneXGemmDirect(
     if(!computeOnCPU) {
       gpuTestCounter += 1;
       configIndex = gpuTestCounter;
+      progressUpdateConfig(gpuTestCounter, plannedGpuIterations);
       if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
         const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - tuningPhaseBegin
@@ -1459,6 +1479,7 @@ static bool tuneXGemm(
     if(!computeOnCPU) {
       gpuTestCounter += 1;
       configIndex = gpuTestCounter;
+      progressUpdateConfig(gpuTestCounter, plannedGpuIterations);
       if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
         const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - tuningPhaseBegin
@@ -1774,6 +1795,7 @@ static bool tuneXGemm16(
     if(!computeOnCPU) {
       gpuTestCounter += 1;
       configIndex = gpuTestCounter;
+      progressUpdateConfig(gpuTestCounter, plannedGpuIterations);
       if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
         const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - tuningPhaseBegin
@@ -2059,6 +2081,7 @@ static bool tuneHGemmWmma(
     if(!computeOnCPU) {
       gpuTestCounter += 1;
       configIndex = gpuTestCounter;
+      progressUpdateConfig(gpuTestCounter, plannedGpuIterations);
       if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
         const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - tuningPhaseBegin
@@ -2388,6 +2411,7 @@ static bool tuneHGemmWmmaNCHW(
     if(!computeOnCPU) {
       gpuTestCounter += 1;
       configIndex = gpuTestCounter;
+      progressUpdateConfig(gpuTestCounter, plannedGpuIterations);
       if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
         const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - tuningPhaseBegin
@@ -2633,6 +2657,7 @@ static void tuneTransform(
     }
     gpuTestCounter += 1;
     configIndex = gpuTestCounter;
+    progressUpdateConfig(gpuTestCounter, plannedGpuIterations);
     if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
       const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - tuningPhaseBegin
@@ -2868,6 +2893,7 @@ static void tuneUntransform(
     }
     gpuTestCounter += 1;
     configIndex = gpuTestCounter;
+    progressUpdateConfig(gpuTestCounter, plannedGpuIterations);
     if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
       const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - tuningPhaseBegin
@@ -3112,6 +3138,7 @@ static void tuneGPool(
     }
     gpuTestCounter += 1;
     configIndex = gpuTestCounter;
+    progressUpdateConfig(gpuTestCounter, plannedGpuIterations);
     if(gpuTestCounter == 1 || (gpuTestCounter % kProgressEmitEvery) == 0) {
       const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - tuningPhaseBegin
@@ -3476,11 +3503,27 @@ void OpenCLTuner::tune(
     " batchSize=" + std::to_string(batchSize)
   );
 
+  {
+    OpenCLTuningProgress* p = OpenCLTuningProgress::getCurrent();
+    if(p != nullptr) {
+      p->setStageOrder({
+        "dummy_thread_start",
+        "tuneXGemmDirect",
+        "tuneXGemm_and_fp16",
+        "tuneTransform",
+        "tuneUntransform",
+        "tuneGPool",
+        "dummy_thread_stop"
+      });
+    }
+  }
+
   out << "Beginning GPU tuning for " << device->info.name << " modelVersion " << modelInfo.modelVersion << " channels " << modelInfo.trunkNumChannels << endl;
 
   // Start a dummy thread to put a bunch of load on the GPU, so that we can encourage dynamic-clock-speed GPUs
   // to stay at a high setting during the tuning.
   emitOpenclInitProbe(logger, "tune stage begin stage=dummy_thread_start");
+  progressBeginStage("dummy_thread_start");
   const auto dummyStartBegin = std::chrono::steady_clock::now();
   WaitableFlag dummyInitializedOrDeadFlag;
   WaitableFlag dummyShouldStopFlag;
@@ -3497,6 +3540,7 @@ void OpenCLTuner::tune(
     std::chrono::steady_clock::now() - dummyStartBegin
   ).count();
   emitOpenclInitProbe(logger, "tune stage done stage=dummy_thread_start durationMs=" + std::to_string(dummyStartElapsedMs));
+  progressCompleteStage("dummy_thread_start", "done");
 
   OpenCLTuneParams untunedConfig = OpenCLTuneParams();
   OpenCLTuneParams currentConfig = initialConfig;
@@ -3532,6 +3576,7 @@ void OpenCLTuner::tune(
   double bestXGemmDirectKernelsPerSecond = 0.0;
   {
     emitOpenclInitProbe(logger, "tune stage begin stage=tuneXGemmDirect");
+    progressBeginStage("tuneXGemmDirect");
     const auto stageBegin = std::chrono::steady_clock::now();
     OpenCLTuneParams result;
     tuneXGemmDirect(
@@ -3557,10 +3602,12 @@ void OpenCLTuner::tune(
       std::chrono::steady_clock::now() - stageBegin
     ).count();
     emitOpenclInitProbe(logger, "tune stage done stage=tuneXGemmDirect durationMs=" + std::to_string(stageElapsedMs));
+    progressCompleteStage("tuneXGemmDirect", "done");
   }
 
   {
     emitOpenclInitProbe(logger, "tune stage begin stage=tuneXGemm_and_fp16");
+    progressBeginStage("tuneXGemm_and_fp16");
     const auto stageBegin = std::chrono::steady_clock::now();
     OpenCLTuneParams result;
     bool useFP16Storage = false;
@@ -3857,6 +3904,7 @@ void OpenCLTuner::tune(
       std::chrono::steady_clock::now() - stageBegin
     ).count();
     emitOpenclInitProbe(logger, "tune stage done stage=tuneXGemm_and_fp16 durationMs=" + std::to_string(stageElapsedMs));
+    progressCompleteStage("tuneXGemm_and_fp16", "done");
   }
 
   out << "------------------------------------------------------" << endl;
@@ -3882,6 +3930,7 @@ void OpenCLTuner::tune(
 
   {
     emitOpenclInitProbe(logger, "tune stage begin stage=tuneTransform");
+    progressBeginStage("tuneTransform");
     const auto stageBegin = std::chrono::steady_clock::now();
     OpenCLTuneParams result;
     tuneTransform(
@@ -3907,10 +3956,12 @@ void OpenCLTuner::tune(
       std::chrono::steady_clock::now() - stageBegin
     ).count();
     emitOpenclInitProbe(logger, "tune stage done stage=tuneTransform durationMs=" + std::to_string(stageElapsedMs));
+    progressCompleteStage("tuneTransform", "done");
   }
 
   {
     emitOpenclInitProbe(logger, "tune stage begin stage=tuneUntransform");
+    progressBeginStage("tuneUntransform");
     const auto stageBegin = std::chrono::steady_clock::now();
     OpenCLTuneParams result;
     tuneUntransform(
@@ -3936,10 +3987,12 @@ void OpenCLTuner::tune(
       std::chrono::steady_clock::now() - stageBegin
     ).count();
     emitOpenclInitProbe(logger, "tune stage done stage=tuneUntransform durationMs=" + std::to_string(stageElapsedMs));
+    progressCompleteStage("tuneUntransform", "done");
   }
 
   {
     emitOpenclInitProbe(logger, "tune stage begin stage=tuneGPool");
+    progressBeginStage("tuneGPool");
     const auto stageBegin = std::chrono::steady_clock::now();
     OpenCLTuneParams result;
     tuneGPool(
@@ -3965,6 +4018,7 @@ void OpenCLTuner::tune(
       std::chrono::steady_clock::now() - stageBegin
     ).count();
     emitOpenclInitProbe(logger, "tune stage done stage=tuneGPool durationMs=" + std::to_string(stageElapsedMs));
+    progressCompleteStage("tuneGPool", "done");
 
   }
 
@@ -3977,6 +4031,7 @@ void OpenCLTuner::tune(
   currentConfig.conv5x5.untransLocalSize2 = currentConfig.conv3x3.untransLocalSize2;
 
   emitOpenclInitProbe(logger, "tune stage begin stage=dummy_thread_stop");
+  progressBeginStage("dummy_thread_stop");
   const auto dummyStopBegin = std::chrono::steady_clock::now();
   dummyShouldStopFlag.setPermanently(true);
   dummyThread.join();
@@ -3984,6 +4039,7 @@ void OpenCLTuner::tune(
     std::chrono::steady_clock::now() - dummyStopBegin
   ).count();
   emitOpenclInitProbe(logger, "tune stage done stage=dummy_thread_stop durationMs=" + std::to_string(dummyStopElapsedMs));
+  progressCompleteStage("dummy_thread_stop", "done");
 
   out << "Done tuning" << endl;
   out << "------------------------------------------------------" << endl;
@@ -3992,6 +4048,11 @@ void OpenCLTuner::tune(
     std::chrono::steady_clock::now() - tuneBegin
   ).count();
   emitOpenclInitProbe(logger, "tune done durationMs=" + std::to_string(tuneElapsedMs));
+  {
+    OpenCLTuningProgress* p = OpenCLTuningProgress::getCurrent();
+    if(p != nullptr)
+      p->complete();
+  }
 }
 
 string OpenCLTuner::defaultDirectory(bool makeDir, const string& homeDataDirOverride) {

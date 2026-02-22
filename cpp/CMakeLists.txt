@@ -131,6 +131,7 @@ elseif(USE_BACKEND STREQUAL "OPENCL")
     neuralnet/openclkernels.cpp
     neuralnet/openclhelpers.cpp
     neuralnet/opencltuner.cpp
+    neuralnet/opencltuningprogress.cpp
     )
 elseif(USE_BACKEND STREQUAL "EIGEN")
   message(STATUS "-DUSE_BACKEND=EIGEN, using Eigen CPU backend.")
